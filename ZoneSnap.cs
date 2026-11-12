@@ -1,14 +1,16 @@
 // ZoneSnap - a tiny window zone-snapping tool for Windows.
 //
 // Hold Shift while dragging a window: zones appear, drop the window on one to snap it.
+// Hold Ctrl+Alt and press Left/Right to hop focus between windows by zone.
 // Right-click the tray icon to pick a layout, edit zones visually, or open zones.ini.
 //
 // Single source file, no dependencies. Rebuild after editing by running build.cmd
 // (uses the C# compiler that ships with Windows, so nothing needs installing).
 //
 // How it stays light: no keyboard or mouse hooks. Windows tells us when a window
-// starts/stops being moved; only during a drag does a 30 ms timer poll the cursor.
-// No network code. Idle CPU use is zero.
+// starts/stops being moved; a 30 ms timer polls the cursor only during a drag, and
+// a 50 ms timer polls the nav modifier only during a short hotkey hop. No network
+// code. Idle CPU use is zero.
 
 using System;
 using System.Collections.Generic;
@@ -43,6 +45,22 @@ namespace ZoneSnap
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
         [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT r, int size);
+        public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc proc, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int index);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint attach, uint attachTo, bool fAttach);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
     }
 
     // ---------------------------------------------------------------- config
@@ -58,6 +76,7 @@ namespace ZoneSnap
         public static readonly string FilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "zones.ini");
 
         public string Key = "shift";                 // shift | ctrl | alt | none (none = always show zones while dragging)
+        public string NavKey = "ctrl+alt";            // ctrl+alt | ctrl (held with Left/Right to hop focus)
         public int Gap = 8;                          // pixels between zones
         public int Opacity = 40;                     // overlay opacity, percent
         public Color ZoneColor = Color.FromArgb(45, 125, 210);
@@ -166,6 +185,7 @@ namespace ZoneSnap
                 switch (k.ToLowerInvariant())
                 {
                     case "key": Key = val.ToLowerInvariant(); break;
+                    case "navkey": NavKey = val.Trim().ToLowerInvariant() == "ctrl" ? "ctrl" : "ctrl+alt"; break;
                     case "gap": if (int.TryParse(val, out n)) Gap = Math.Max(0, Math.Min(100, n)); break;
                     case "opacity": if (int.TryParse(val, out n)) Opacity = Math.Max(10, Math.Min(100, n)); break;
                     case "color": ZoneColor = ParseColor(val, ZoneColor); break;
@@ -184,6 +204,8 @@ namespace ZoneSnap
             sb.AppendLine("[settings]");
             sb.AppendLine("# key: shift, ctrl, alt, or none (none = zones always show while dragging)");
             sb.AppendLine("key = " + Key);
+            sb.AppendLine("# navkey: ctrl+alt or ctrl - held with Left/Right to hop focus between windows");
+            sb.AppendLine("navkey = " + NavKey);
             sb.AppendLine("# gap: pixels of space between zones");
             sb.AppendLine("gap = " + Gap);
             sb.AppendLine("# opacity: 10-100");
@@ -248,6 +270,7 @@ namespace ZoneSnap
         public Rectangle[] Hit;      // zone areas without gap, screen coordinates (for hit testing)
         public Rectangle[] Zones;    // zone areas with gap, screen coordinates (drawn, and snapped to)
         public int Hot = -1;
+        public Rectangle TargetRect;  // screen coords of the window a hop will focus; Empty = none
         Config cfg;
 
         public Overlay(Screen s, Config c)
@@ -310,6 +333,13 @@ namespace ZoneSnap
                     float size = Math.Max(18, Math.Min(r.Width, r.Height) / 5);
                     using (Font f = new Font("Segoe UI", size, FontStyle.Bold, GraphicsUnit.Pixel))
                         g.DrawString((i + 1).ToString(), f, Brushes.White, r, sf);
+                }
+                if (!TargetRect.IsEmpty)
+                {
+                    Rectangle tr = TargetRect;
+                    tr.Offset(-o.X, -o.Y);
+                    tr.Inflate(1, 1);
+                    using (Pen outline = new Pen(Color.White, 3)) g.DrawRectangle(outline, tr);
                 }
             }
         }
@@ -540,6 +570,27 @@ namespace ZoneSnap
         }
     }
 
+    // ---------------------------------------------------------------- hotkeys
+
+    // Hidden window that receives WM_HOTKEY from RegisterHotKey. Never shown.
+    class HotkeyForm : Form
+    {
+        public event Action<int> Hotkey;
+
+        public HotkeyForm()
+        {
+            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.None;
+            IntPtr h = Handle;      // force handle creation so hotkey messages have a target
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x0312 && Hotkey != null) Hotkey(m.WParam.ToInt32());
+            base.WndProc(ref m);
+        }
+    }
+
     // ------------------------------------------------------------------- app
 
     class App : ApplicationContext
@@ -557,6 +608,17 @@ namespace ZoneSnap
         bool shown, hasTarget;
         Rectangle target;
         Editor editor;
+        Timer navTimer = new Timer();
+        HotkeyForm hotkeyForm;
+        uint hotMods;
+        bool hotkeysOk, navWarned;
+        static readonly uint MyPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+
+        class ZoneRef
+        {
+            public Overlay O;
+            public int Index;
+        }
 
         public App()
         {
@@ -564,7 +626,7 @@ namespace ZoneSnap
 
             tray = new NotifyIcon();
             tray.Icon = MakeIcon();
-            tray.Text = "ZoneSnap - hold Shift while dragging a window";
+            tray.Text = "ZoneSnap - Shift-drag snaps, Ctrl+Alt+Left/Right hops";
             tray.ContextMenuStrip = new ContextMenuStrip();
             tray.ContextMenuStrip.Opening += delegate { BuildMenu(); };
             tray.DoubleClick += delegate { Edit(Screen.PrimaryScreen); };
@@ -572,6 +634,13 @@ namespace ZoneSnap
 
             timer.Interval = 30;
             timer.Tick += delegate { Tick(); };
+
+            navTimer.Interval = 50;
+            navTimer.Tick += delegate { NavTick(); };
+
+            hotkeyForm = new HotkeyForm();
+            hotkeyForm.Hotkey += OnHotkey;
+            EnsureHotkeys();
 
             // EVENT_SYSTEM_MOVESIZESTART (0x0A) .. EVENT_SYSTEM_MOVESIZEEND (0x0B), out of context, skip own windows
             proc = OnWinEvent;
@@ -635,6 +704,8 @@ namespace ZoneSnap
             if (editor != null || hwnd == IntPtr.Zero) return;
             cfg.ReloadIfChanged();
             if (IsResize(hwnd)) return;
+            navTimer.Stop();
+            foreach (Overlay o in overlays) { o.Hot = -1; o.TargetRect = Rectangle.Empty; }
             drag = hwnd;
             timer.Start();
             Tick();
@@ -708,27 +779,207 @@ namespace ZoneSnap
                 Native.SetWindowPos(h, IntPtr.Zero, x, y, w, hgt, flags);
         }
 
+        // ------------------------------------------------------- focus hopping
+
+        static uint NavMods(Config c)
+        {
+            return c.NavKey == "ctrl" ? 0x0002u /*MOD_CONTROL*/ : 0x0003u /*MOD_CONTROL | MOD_ALT*/;
+        }
+
+        void EnsureHotkeys()
+        {
+            uint mods = NavMods(cfg);
+            if (hotkeysOk && mods == hotMods) return;
+            Native.UnregisterHotKey(hotkeyForm.Handle, 1);
+            Native.UnregisterHotKey(hotkeyForm.Handle, 2);
+            hotMods = mods;
+            hotkeysOk = Native.RegisterHotKey(hotkeyForm.Handle, 1, mods, 0x25 /*VK_LEFT*/)
+                     && Native.RegisterHotKey(hotkeyForm.Handle, 2, mods, 0x27 /*VK_RIGHT*/);
+            if (!hotkeysOk)
+            {
+                Native.UnregisterHotKey(hotkeyForm.Handle, 1);
+                Native.UnregisterHotKey(hotkeyForm.Handle, 2);
+                if (!navWarned)
+                {
+                    navWarned = true;
+                    tray.ShowBalloonTip(4000, "ZoneSnap",
+                        "Could not register the focus-hop hotkeys; another app may be using them.",
+                        ToolTipIcon.Warning);
+                }
+            }
+            else navWarned = false;
+        }
+
+        void OnHotkey(int id)
+        {
+            if (drag == IntPtr.Zero && editor == null) Hop(id == 1 ? -1 : 1);
+        }
+
+        bool NavKeyHeld()
+        {
+            if ((Native.GetAsyncKeyState(0x11 /*VK_CONTROL*/) & 0x8000) == 0) return false;
+            return cfg.NavKey != "ctrl+alt" || (Native.GetAsyncKeyState(0x12 /*VK_MENU*/) & 0x8000) != 0;
+        }
+
+        void NavTick()
+        {
+            if (NavKeyHeld()) return;
+            navTimer.Stop();
+            HideOverlays();
+        }
+
+        static bool Eligible(IntPtr h)
+        {
+            if (h == IntPtr.Zero || !Native.IsWindow(h) || !Native.IsWindowVisible(h) || Native.IsIconic(h)) return false;
+            if (Native.GetWindowTextLength(h) == 0) return false;
+            StringBuilder cls = new StringBuilder(32);
+            Native.GetClassName(h, cls, cls.Capacity);
+            string cn = cls.ToString();
+            if (cn == "Progman" || cn == "WorkerW" || cn == "Shell_TrayWnd" || cn == "Shell_SecondaryTrayWnd") return false;
+            int ex = Native.GetWindowLong(h, -20 /*GWL_EXSTYLE*/);
+            if ((ex & 0x80 /*TOOLWINDOW*/) != 0 || (ex & 0x08000000 /*NOACTIVATE*/) != 0) return false;
+            uint pid;
+            Native.GetWindowThreadProcessId(h, out pid);
+            if (pid == MyPid) return false;
+            int cloaked;
+            if (Native.DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, out cloaked, 4) == 0 && cloaked != 0) return false;
+            return true;
+        }
+
+        static Rectangle VisibleRect(IntPtr h)
+        {
+            Native.RECT r;
+            bool got = Native.DwmGetWindowAttribute(h, 9 /*DWMWA_EXTENDED_FRAME_BOUNDS*/, out r, 16) == 0;
+            if (!got || r.R <= r.L || r.B <= r.T) got = Native.GetWindowRect(h, out r);
+            return got && r.R > r.L && r.B > r.T ? Rectangle.FromLTRB(r.L, r.T, r.R, r.B) : Rectangle.Empty;
+        }
+
+        static int BestZone(List<ZoneRef> order, Rectangle w)
+        {
+            if (w.IsEmpty) return -1;
+            int best = -1;
+            long bestArea = 0;
+            for (int i = 0; i < order.Count; i++)
+            {
+                Rectangle x = Rectangle.Intersect(w, order[i].O.Hit[order[i].Index]);
+                if (x.IsEmpty) continue;
+                long a = (long)x.Width * x.Height;
+                if (a > bestArea) { bestArea = a; best = i; }
+            }
+            return best;
+        }
+
+        static int NearestZone(List<ZoneRef> order, Rectangle w)
+        {
+            if (w.IsEmpty) return order.Count > 0 ? 0 : -1;
+            int cx = w.Left + w.Width / 2, cy = w.Top + w.Height / 2;
+            int best = -1;
+            long bestD = long.MaxValue;
+            for (int i = 0; i < order.Count; i++)
+            {
+                Rectangle z = order[i].O.Hit[order[i].Index];
+                long dx = z.Left + z.Width / 2 - cx, dy = z.Top + z.Height / 2 - cy;
+                long d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            return best;
+        }
+
+        static bool ForceForeground(IntPtr h)
+        {
+            if (Native.IsIconic(h)) Native.ShowWindow(h, 9 /*SW_RESTORE*/);
+            if (Native.GetForegroundWindow() == h) return true;
+            uint pid;
+            IntPtr fg = Native.GetForegroundWindow();
+            uint tid = fg == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(fg, out pid);
+            uint me = Native.GetCurrentThreadId();
+            bool attached = tid != 0 && tid != me && Native.AttachThreadInput(me, tid, true);
+            Native.SetForegroundWindow(h);
+            if (attached) Native.AttachThreadInput(me, tid, false);
+            if (Native.GetForegroundWindow() != h)
+            {
+                Native.keybd_event(0x12, 0, 0, IntPtr.Zero);      // Alt down
+                Native.keybd_event(0x12, 0, 2, IntPtr.Zero);      // Alt up
+                Native.SetForegroundWindow(h);
+            }
+            return Native.GetForegroundWindow() == h;
+        }
+
+        void Hop(int dir)
+        {
+            cfg.ReloadIfChanged();
+            EnsureHotkeys();
+            BuildOverlays();
+
+            List<ZoneRef> order = new List<ZoneRef>();
+            foreach (Overlay o in overlays)
+                for (int i = 0; i < o.Hit.Length; i++)
+                    order.Add(new ZoneRef { O = o, Index = i });
+            if (order.Count == 0) return;
+            order.Sort(delegate(ZoneRef a, ZoneRef b)
+            {
+                Rectangle ra = a.O.Hit[a.Index], rb = b.O.Hit[b.Index];
+                int c = (ra.Left + ra.Right).CompareTo(rb.Left + rb.Right);   // centre X, then centre Y
+                return c != 0 ? c : (ra.Top + ra.Bottom).CompareTo(rb.Top + rb.Bottom);
+            });
+
+            IntPtr[] wins = new IntPtr[order.Count];      // topmost window per zone, filled in z-order
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Eligible(h)) return true;
+                int z = BestZone(order, VisibleRect(h));
+                if (z >= 0 && wins[z] == IntPtr.Zero) wins[z] = h;
+                return true;
+            }, IntPtr.Zero);
+
+            IntPtr fg = Native.GetForegroundWindow();
+            Rectangle fr = fg == IntPtr.Zero ? Rectangle.Empty : VisibleRect(fg);
+            int start;
+            if (!fr.IsEmpty)
+            {
+                start = BestZone(order, fr);
+                if (start < 0) start = NearestZone(order, fr);
+            }
+            else start = dir > 0 ? -1 : order.Count;
+
+            for (int i = start + dir; i >= 0 && i < order.Count; i += dir)
+            {
+                if (wins[i] == IntPtr.Zero) continue;     // empty zone: skip
+                if (!ForceForeground(wins[i])) return;
+                ShowOverlays();
+                foreach (Overlay o in overlays) { o.TargetRect = Rectangle.Empty; o.SetHot(-1); }
+                order[i].O.TargetRect = VisibleRect(wins[i]);
+                order[i].O.SetHot(order[i].Index);
+                navTimer.Stop();
+                navTimer.Start();
+                return;
+            }
+        }
+
         // ------------------------------------------------------------ overlays
 
-        void ShowOverlays()
+        void BuildOverlays()
         {
             StringBuilder sig = new StringBuilder();
             sig.Append(cfg.Version);
             foreach (Screen s in Screen.AllScreens) sig.Append('|').Append(s.DeviceName).Append(s.WorkingArea.ToString());
-            if (sig.ToString() != builtFor)
-            {
-                foreach (Overlay o in overlays) o.Dispose();
-                overlays.Clear();
-                foreach (Screen s in Screen.AllScreens) overlays.Add(new Overlay(s, cfg));
-                builtFor = sig.ToString();
-            }
+            if (sig.ToString() == builtFor) return;
+            foreach (Overlay o in overlays) o.Dispose();
+            overlays.Clear();
+            foreach (Screen s in Screen.AllScreens) overlays.Add(new Overlay(s, cfg));
+            builtFor = sig.ToString();
+        }
+
+        void ShowOverlays()
+        {
+            BuildOverlays();
             foreach (Overlay o in overlays) o.Show();
             shown = true;
         }
 
         void HideOverlays()
         {
-            foreach (Overlay o in overlays) { o.Hide(); o.Hot = -1; }
+            foreach (Overlay o in overlays) { o.Hide(); o.Hot = -1; o.TargetRect = Rectangle.Empty; }
             shown = false;
             hasTarget = false;
         }
@@ -738,6 +989,7 @@ namespace ZoneSnap
         void BuildMenu()
         {
             cfg.ReloadIfChanged();
+            EnsureHotkeys();
             ToolStripItemCollection root = tray.ContextMenuStrip.Items;
             root.Clear();
             Screen[] screens = Screen.AllScreens;
@@ -864,6 +1116,9 @@ namespace ZoneSnap
         void Quit()
         {
             if (hook != IntPtr.Zero) Native.UnhookWinEvent(hook);
+            Native.UnregisterHotKey(hotkeyForm.Handle, 1);
+            Native.UnregisterHotKey(hotkeyForm.Handle, 2);
+            hotkeyForm.Dispose();
             tray.Visible = false;
             tray.Dispose();
             ExitThread();
